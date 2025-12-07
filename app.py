@@ -1,701 +1,362 @@
-# main.py
+import os
+import json
+import re
+import pandas as pd
+import numpy as np  # 新增 numpy 以便處理型別
+import gspread
 from flask import Flask, request, jsonify
 from google.oauth2.service_account import Credentials
-import gspread
-import logging
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-import time
-
-# 配置日誌
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from gspread_formatting import *
 
 app = Flask(__name__)
 
-# Google Sheets 配置
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-SPREADSHEET_ID = 'YOUR_SPREADSHEET_ID'  # 需要配置
+# --- 🔧 初始化與設定 ---
+def get_sh():
+    creds_json = os.environ.get('GOOGLE_CREDENTIALS')
+    sheet_id = os.environ.get('SHEET_ID')
+    
+    if not creds_json or not sheet_id:
+        raise Exception("環境變數設定錯誤：找不到 GOOGLE_CREDENTIALS 或 SHEET_ID")
 
-class GoogleSheetsService:
-    """Google Sheets 服務類"""
-    
-    def __init__(self, credentials_path: str, spreadsheet_id: str):
-        self.credentials = Credentials.from_service_account_file(
-            credentials_path, scopes=SCOPES
-        )
-        self.client = gspread.authorize(self.credentials)
-        self.spreadsheet = self.client.open_by_key(spreadsheet_id)
-    
-    def get_sheet(self, sheet_name: str):
-        """獲取工作表"""
-        try:
-            return self.spreadsheet.worksheet(sheet_name)
-        except gspread.exceptions.WorksheetNotFound:
-            return None
-    
-    def create_sheet(self, sheet_name: str):
-        """創建新工作表"""
-        try:
-            return self.spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=50)
-        except Exception as e:
-            logger.error(f"創建工作表失敗: {e}")
-            return None
-    
-    def delete_sheet(self, sheet_name: str):
-        """刪除工作表"""
-        try:
-            sheet = self.get_sheet(sheet_name)
-            if sheet:
-                self.spreadsheet.del_worksheet(sheet)
-                return True
-        except Exception as e:
-            logger.error(f"刪除工作表失敗: {e}")
-        return False
-    
-    def clear_sheet(self, sheet_name: str):
-        """清空工作表"""
-        sheet = self.get_sheet(sheet_name)
-        if sheet:
-            sheet.clear()
-            return True
-        return False
+    creds_dict = json.loads(creds_json)
+    scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    return client.open_by_key(sheet_id)
 
-class ProcessStatus:
-    """流程狀態管理"""
-    
-    def __init__(self, sheets_service: GoogleSheetsService):
-        self.sheets_service = sheets_service
-        self.status_sheet_name = '🔄執行狀態'
-    
-    def set_status(self, status: str):
-        """設置狀態"""
-        try:
-            sheet = self.sheets_service.get_sheet(self.status_sheet_name)
-            if not sheet:
-                sheet = self.sheets_service.create_sheet(self.status_sheet_name)
-                sheet.update('A1:C1', [['狀態', '時間戳記', '詳細信息']])
-            
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            sheet.update('A2:C2', [[status, timestamp, f'狀態更新於 {timestamp}']])
-            logger.info(f"📊 狀態已更新: {status} at {timestamp}")
-        except Exception as e:
-            logger.error(f"設置狀態失敗: {e}")
-    
-    def get_status(self) -> str:
-        """獲取狀態"""
-        try:
-            sheet = self.sheets_service.get_sheet(self.status_sheet_name)
-            if not sheet:
-                return 'NOT_STARTED'
-            
-            value = sheet.acell('A2').value
-            return value if value else 'NOT_STARTED'
-        except Exception as e:
-            logger.error(f"獲取狀態失敗: {e}")
-            return 'ERROR'
-    
-    def clear_status(self):
-        """清除狀態"""
-        try:
-            self.sheets_service.delete_sheet(self.status_sheet_name)
-            logger.info('🧹 狀態已清除')
-        except Exception as e:
-            logger.error(f"清除狀態失敗: {e}")
+# --- 🛠️ 輔助函數 ---
+def parse_route_options(value_str):
+    if not value_str or pd.isna(value_str):
+        return []
+    matches = re.findall(r'(\d+)%([^\s,]+)', str(value_str))
+    options = []
+    for pct, label in matches:
+        options.append({'percentage': int(pct), 'label': label})
+    options.sort(key=lambda x: x['percentage'], reverse=True)
+    return options
 
-class WorkspaceManager:
-    """工作區管理"""
-    
-    def __init__(self, sheets_service: GoogleSheetsService):
-        self.sheets_service = sheets_service
-        self.keep_sheets = {
-            '託收託運回報', 'GAI每日訂單分析', '5678月貨主收送點參照', 
-            '5678月班別路線參照', '參照', '碳排', '配送地址參照', '低碳路線表',
-            '託收託運回報_篩選(B)', '當日各路線表(B)', '各路線板數(B)',
-            '託收託運回報_篩選(C)', '當日各路線表(C)', '各路線板數(C)',
-            '退貨表', '託收托運點資訊', '託收托運點資訊(簡)', '指定日期',
-            '託收託運回報_篩選', '當日各路線表', '各路線板數', '路線表'
-        }
-    
-    def clear_workspace(self, mode: str = 'A'):
-        """清除桌面"""
-        try:
-            all_sheets = self.sheets_service.spreadsheet.worksheets()
-            
-            for sheet in all_sheets:
-                sheet_name = sheet.title
-                
-                # 根據模式決定要刪除的工作表
-                if mode == 'D':
-                    if '(D)' in sheet_name or sheet_name == '託收託運回報_篩選(D)':
-                        self.sheets_service.delete_sheet(sheet_name)
-                else:
-                    if sheet_name not in self.keep_sheets:
-                        self.sheets_service.delete_sheet(sheet_name)
-            
-            logger.info(f"✅ 清除桌面完成 (模式: {mode})")
-            return True
-        except Exception as e:
-            logger.error(f"清除桌面失敗: {e}")
-            return False
-
-class DateFilter:
-    """日期篩選器"""
-    
-    def __init__(self, sheets_service: GoogleSheetsService):
-        self.sheets_service = sheets_service
-    
-    def format_date_for_comparison(self, date_value) -> str:
-        """格式化日期用於比較"""
-        if not date_value:
-            return ''
-        
-        try:
-            if isinstance(date_value, datetime):
-                date_obj = date_value
-            elif isinstance(date_value, str):
-                date_obj = datetime.strptime(date_value, '%Y-%m-%d')
-            else:
-                return ''
-            
-            return date_obj.strftime('%Y-%m-%d')
-        except Exception as e:
-            logger.error(f"日期格式化失敗: {e}")
-            return ''
-    
-    def filter_data_by_date(self, mode: str = 'A') -> bool:
-        """日期篩選"""
-        try:
-            # 獲取指定日期
-            date_sheet = self.sheets_service.get_sheet('指定日期')
-            if not date_sheet:
-                logger.error("找不到「指定日期」工作表")
-                return False
-            
-            # 根據模式選擇日期單元格
-            cell_ref = 'A3' if mode == 'D' else 'A2'
-            target_date = date_sheet.acell(cell_ref).value
-            
-            if not target_date:
-                logger.error("未設定目標日期")
-                return False
-            
-            target_date_str = self.format_date_for_comparison(target_date)
-            
-            # 獲取原始數據
-            report_sheet = self.sheets_service.get_sheet('託收託運回報')
-            if not report_sheet:
-                logger.error("找不到「託收託運回報」工作表")
-                return False
-            
-            all_data = report_sheet.get_all_values()
-            if len(all_data) < 2:
-                logger.error("數據不足")
-                return False
-            
-            # 篩選數據
-            headers = all_data[0]
-            filtered_data = [headers]
-            
-            for row in all_data[1:]:
-                if len(row) > 5:
-                    f_column_value = row[5]  # F欄
-                    f_date_str = self.format_date_for_comparison(f_column_value)
-                    
-                    if f_date_str == target_date_str:
-                        filtered_data.append(row)
-            
-            if len(filtered_data) <= 1:
-                logger.error("沒有符合條件的數據")
-                return False
-            
-            # 寫入篩選結果
-            sheet_name = f'託收託運回報_篩選({mode})' if mode != 'A' else '託收託運回報_篩選'
-            filtered_sheet = self.sheets_service.get_sheet(sheet_name)
-            
-            if not filtered_sheet:
-                filtered_sheet = self.sheets_service.create_sheet(sheet_name)
-            else:
-                filtered_sheet.clear()
-            
-            # 批量寫入數據
-            if filtered_data:
-                filtered_sheet.update(f'A1:Z{len(filtered_data)}', filtered_data)
-            
-            logger.info(f"✅ 日期篩選完成，共 {len(filtered_data)-1} 筆數據")
-            return True
-            
-        except Exception as e:
-            logger.error(f"日期篩選失敗: {e}")
-            return False
-
-class RouteMapper:
-    """路線比對器"""
-    
-    def __init__(self, sheets_service: GoogleSheetsService):
-        self.sheets_service = sheets_service
-    
-    def preprocess_h_value(self, h_value: str) -> str:
-        """預處理 H 欄值"""
-        if not h_value:
-            return ''
-        h_string = str(h_value).strip()
-        return h_string[3:] if h_string.startswith('(預)') else h_string
-    
-    def parse_percentage_strings(self, value: str) -> List[Dict]:
-        """解析百分比字串"""
-        if not value or value == '無':
-            return []
-        
-        import re
-        matches = re.finditer(r'(\d+)%([^\s]+)', value)
-        return [
-            {'percentage': int(match.group(1)), 'label': match.group(2)}
-            for match in matches
-        ]
-    
-    def format_label(self, option: Dict, c_value: str, d_value: str) -> str:
-        """格式化標籤"""
-        prefix = '早-' if option['label'] in c_value else '晚-'
-        return prefix + option['label']
-    
-    def auto_route_mapping(self, mode: str = 'A') -> bool:
-        """自動路線比對"""
-        try:
-            # 確定工作表名稱
-            sheet_name = f'託收託運回報_篩選({mode})' if mode != 'A' else '託收託運回報_篩選'
-            
-            report_sheet = self.sheets_service.get_sheet(sheet_name)
-            reference_sheet = self.sheets_service.get_sheet('5678月貨主收送點參照')
-            
-            if not report_sheet or not reference_sheet:
-                logger.error("找不到必要的工作表")
-                return False
-            
-            report_data = report_sheet.get_all_values()
-            reference_data = reference_sheet.get_all_values()
-            
-            # 建立參照映射
-            reference_map = {}
-            for row in reference_data[1:]:
-                if len(row) >= 4:
-                    ref_owner = row[0]
-                    ref_point = row[1]
-                    if ref_owner and ref_point:
-                        key = f"{ref_owner}|{ref_point}"
-                        reference_map[key] = {
-                            'c_value': row[2],
-                            'd_value': row[3]
-                        }
-            
-            # 處理路線比對
-            route1_values = []
-            route2_values = [] if mode == 'B' else None
-            
-            for row in report_data[1:]:
-                if len(row) >= 8:
-                    report_owner = row[4]  # E欄
-                    h_value = row[7]  # H欄
-                    report_point = self.preprocess_h_value(h_value)
-                    key = f"{report_owner}|{report_point}"
-                    
-                    route_data = reference_map.get(key)
-                    if route_data:
-                        c_value = route_data['c_value']
-                        d_value = route_data['d_value']
-                        c_options = self.parse_percentage_strings(c_value)
-                        d_options = self.parse_percentage_strings(d_value)
-                        all_options = sorted(
-                            c_options + d_options,
-                            key=lambda x: x['percentage'],
-                            reverse=True
-                        )
-                        
-                        # 第一路線
-                        route1_values.append([
-                            self.format_label(all_options[0], c_value, d_value)
-                            if all_options else ''
-                        ])
-                        
-                        # B模態需要第二路線
-                        if mode == 'B' and len(all_options) > 1 and all_options[1]['percentage'] > 40:
-                            route2_values.append([
-                                self.format_label(all_options[1], c_value, d_value)
-                            ])
-                        elif mode == 'B':
-                            route2_values.append([''])
-                    else:
-                        route1_values.append([''])
-                        if mode == 'B':
-                            route2_values.append([''])
-            
-            # 寫入結果
-            if route1_values:
-                # X欄 (第24欄)
-                report_sheet.update(f'X2:X{len(route1_values)+1}', route1_values)
-                
-                # 清空 AH 和 AI 欄
-                empty_values = [['']] * len(route1_values)
-                report_sheet.update(f'AH2:AH{len(route1_values)+1}', empty_values)
-                report_sheet.update(f'AI2:AI{len(route1_values)+1}', empty_values)
-                
-                # B模態寫入第二路線到 AH 欄
-                if mode == 'B' and route2_values:
-                    report_sheet.update(f'AH2:AH{len(route2_values)+1}', route2_values)
-            
-            logger.info(f"✅ 路線比對完成 (模式: {mode})")
-            return True
-            
-        except Exception as e:
-            logger.error(f"路線比對失敗: {e}")
-            return False
-
-class RouteOrderManager:
-    """路線順序管理"""
-    
-    @staticmethod
-    def get_route_order() -> List[str]:
-        """獲取路線順序"""
-        routes = []
-        for period in ['早', '晚']:
-            for region in ['北', '中', '南']:
-                for num in range(1, 19):
-                    routes.append(f'{period}-{region}{"一二三四五六七八九十十一十二十三十四十五十六十七十八"[num-1] if num <= 10 else "十" + "一二三四五六七八"[num-11]}線')
-        return routes
-
-class SheetCreator:
-    """工作表創建器"""
-    
-    def __init__(self, sheets_service: GoogleSheetsService):
-        self.sheets_service = sheets_service
-        self.route_order = RouteOrderManager.get_route_order()
-    
-    def create_sheets_by_route(self, mode: str = 'A') -> bool:
-        """按路線創建工作表"""
-        try:
-            logger.info(f'🚀 開始創建路線工作表 (模式: {mode})')
-            
-            # 確定工作表名稱
-            source_name = f'託收託運回報_篩選({mode})' if mode != 'A' else '託收託運回報_篩選'
-            combined_name = f'當日各路線表({mode})' if mode != 'A' else '當日各路線表'
-            summary_name = f'各路線板數({mode})' if mode != 'A' else '各路線板數'
-            
-            report_sheet = self.sheets_service.get_sheet(source_name)
-            if not report_sheet:
-                logger.error(f'找不到 {source_name} 工作表')
-                return False
-            
-            # 讀取數據
-            data = report_sheet.get_all_values()
-            if len(data) < 2:
-                logger.error('數據不足')
-                return False
-            
-            # 準備合併工作表
-            combined_sheet = self.sheets_service.get_sheet(combined_name)
-            if not combined_sheet:
-                combined_sheet = self.sheets_service.create_sheet(combined_name)
-            else:
-                combined_sheet.clear()
-            
-            # 分類數據
-            route_data = {route: [] for route in self.route_order}
-            unmatched_data = []
-            route_order_set = set(self.route_order)
-            
-            for row in data[1:]:
-                if len(row) > 23:
-                    h_value = row[7]
-                    # 根據模式選擇路線欄位
-                    if mode == 'B':
-                        primary_route = str(row[23]).strip().rstrip(',') if row[23] else ''
-                        secondary_route = str(row[33]).strip().rstrip(',') if row[33] else ''
-                    else:
-                        primary_route = str(row[23]).strip().rstrip(',') if row[23] else ''
-                        secondary_route = ''
-                    
-                    # 排除昶青
-                    if h_value and '昶青' in str(h_value):
-                        continue
-                    
-                    # 分配到路線
-                    if primary_route and primary_route in route_order_set:
-                        route_data[primary_route].append(row)
-                    
-                    if mode == 'B' and secondary_route and secondary_route in route_order_set:
-                        if secondary_route != primary_route:
-                            route_data[secondary_route].append(row)
-                    
-                    if not primary_route and not secondary_route:
-                        unmatched_data.append(row)
-            
-            # 構建合併數據
-            combined_data = [data[0]]  # 標題行
-            
-            for route in self.route_order:
-                route_rows = route_data[route]
-                if route_rows:
-                    # 空行
-                    combined_data.append([''] * len(data[0]))
-                    # 路線標題
-                    title_row = [''] * len(data[0])
-                    title_row[0] = route
-                    combined_data.append(title_row)
-                    # 路線數據
-                    combined_data.extend(route_rows)
-                    # 總和行
-                    sum_p = sum(
-                        float(row[17]) if row[17] and str(row[17]).replace('.', '').isdigit() else 0
-                        for row in route_rows
-                    )
-                    sum_row = [''] * len(data[0])
-                    sum_row[17] = f'總和: {sum_p}'
-                    combined_data.append(sum_row)
-            
-            # 未匹配數據
-            if unmatched_data:
-                combined_data.append([''] * len(data[0]))
-                title_row = [''] * len(data[0])
-                title_row[0] = '尚未排派路線'
-                combined_data.append(title_row)
-                combined_data.extend(unmatched_data)
-                sum_p = sum(
-                    float(row[17]) if row[17] and str(row[17]).replace('.', '').isdigit() else 0
-                    for row in unmatched_data
-                )
-                sum_row = [''] * len(data[0])
-                sum_row[17] = f'總和: {sum_p}'
-                combined_data.append(sum_row)
-            
-            # 寫入合併數據
-            if combined_data:
-                combined_sheet.update(f'A1:Z{len(combined_data)}', combined_data)
-            
-            # 創建摘要
-            self._create_summary(summary_name, route_data)
-            
-            logger.info(f'✅ 路線工作表創建完成 (模式: {mode})')
-            return True
-            
-        except Exception as e:
-            logger.error(f'路線工作表創建失敗: {e}')
-            return False
-    
-    def _create_summary(self, summary_name: str, route_data: Dict):
-        """創建摘要工作表"""
-        try:
-            summary_sheet = self.sheets_service.get_sheet(summary_name)
-            if not summary_sheet:
-                summary_sheet = self.sheets_service.create_sheet(summary_name)
-            else:
-                summary_sheet.clear()
-            
-            summary_data = [['路線名稱', '板數總和', '取貨', '配送']]
-            
-            for route in self.route_order:
-                rows = route_data.get(route, [])
-                if not rows:
-                    continue
-                
-                total_boards = 0
-                pickup_map = {}
-                delivery_map = {}
-                
-                for row in rows:
-                    if len(row) > 17:
-                        customer_name = row[7]
-                        service_type = row[6]
-                        board_count = float(row[17]) if row[17] and str(row[17]).replace('.', '').isdigit() else 0
-                        
-                        if not customer_name:
-                            continue
-                        
-                        total_boards += board_count
-                        
-                        if service_type == '取貨':
-                            pickup_map[customer_name] = pickup_map.get(customer_name, 0) + board_count
-                        elif service_type == '配送':
-                            delivery_map[customer_name] = delivery_map.get(customer_name, 0) + board_count
-                
-                pickup_string = ', '.join([f'{name} ({total})' for name, total in pickup_map.items()])
-                delivery_string = ', '.join([f'{name} ({total})' for name, total in delivery_map.items()])
-                
-                summary_data.append([route, total_boards, pickup_string, delivery_string])
-            
-            if len(summary_data) > 1:
-                summary_sheet.update(f'A1:D{len(summary_data)}', summary_data)
-            
-            logger.info('✅ 摘要工作表創建完成')
-            
-        except Exception as e:
-            logger.error(f'摘要創建失敗: {e}')
-
-# API 路由
-@app.route('/api/step1', methods=['POST'])
-def step1_clear_workspace():
-    """步驟1：清除桌面"""
+def format_date(val):
+    if pd.isna(val) or val == '': return ''
     try:
-        data = request.json
-        mode = data.get('mode', 'A')
+        return pd.to_datetime(val).strftime('%Y-%m-%d')
+    except:
+        return str(val)
+
+def deduplicate_headers(headers):
+    """
+    將重複的標題加上後綴 _1, _2，確保欄位名稱唯一
+    """
+    seen = {}
+    new_headers = []
+    for i, h in enumerate(headers):
+        h = str(h).strip()
+        if h == "": h = f"Col_{i+1}"
         
-        sheets_service = GoogleSheetsService('credentials.json', SPREADSHEET_ID)
-        status_manager = ProcessStatus(sheets_service)
-        workspace_manager = WorkspaceManager(sheets_service)
-        
-        status_manager.set_status('STEP1_RUNNING')
-        
-        result = workspace_manager.clear_workspace(mode)
-        
-        if result:
-            status_manager.set_status('STEP1_COMPLETED')
-            return jsonify({'success': True, 'message': '步驟1：清除桌面完成'})
+        if h in seen:
+            seen[h] += 1
+            new_headers.append(f"{h}_{seen[h]}")
         else:
-            status_manager.set_status('STEP1_FAILED')
-            return jsonify({'success': False, 'message': '步驟1失敗'}), 500
-            
-    except Exception as e:
-        logger.error(f"步驟1失敗: {e}")
-        return jsonify({'success': False, 'message': str(e)}), 500
+            seen[h] = 0
+            new_headers.append(h)
+    return new_headers
 
-@app.route('/api/step2', methods=['POST'])
-def step2_filter_data():
-    """步驟2：日期篩選"""
-    try:
-        data = request.json
-        mode = data.get('mode', 'A')
+# --- 🧹 步驟 1: 清除桌面 ---
+def step1_clear(sh, mode='A'):
+    keep_sheets = {
+        '託收託運回報', 'GAI每日訂單分析', '5678月貨主收送點參照', '5678月班別路線參照', 
+        '參照', '碳排', '配送地址參照', '低碳路線表', '退貨表', '託收托運點資訊', 
+        '託收托運點資訊(簡)', '指定日期'
+    }
+    
+    worksheets = sh.worksheets()
+    deleted_count = 0
+    
+    for ws in worksheets:
+        name = ws.title
+        should_delete = False
         
-        sheets_service = GoogleSheetsService('credentials.json', SPREADSHEET_ID)
-        status_manager = ProcessStatus(sheets_service)
-        date_filter = DateFilter(sheets_service)
-        
-        status_manager.set_status('STEP2_RUNNING')
-        
-        result = date_filter.filter_data_by_date(mode)
-        
-        if result:
-            status_manager.set_status('STEP2_COMPLETED')
-            return jsonify({'success': True, 'message': '步驟2：日期篩選完成'})
+        if mode == 'D':
+            if '(D)' in name or name == '託收託運回報_篩選(D)':
+                should_delete = True
         else:
-            status_manager.set_status('STEP2_FAILED')
-            return jsonify({'success': False, 'message': '步驟2失敗'}), 500
-            
-    except Exception as e:
-        logger.error(f"步驟2失敗: {e}")
-        return jsonify({'success': False, 'message': str(e)}), 500
+            if name not in keep_sheets:
+                if any(k in name for k in ['篩選', '路線表', '板數', '(B)', '(C)', '(D)']):
+                    should_delete = True
+        
+        if should_delete:
+            try:
+                sh.del_worksheet(ws)
+                deleted_count += 1
+            except:
+                pass
+                
+    return f"[{mode}模態] 已清除 {deleted_count} 個工作表"
 
-@app.route('/api/step3', methods=['POST'])
-def step3_route_mapping():
-    """步驟3：路線比對"""
+# --- 📅 步驟 2: 日期篩選 ---
+def step2_filter(sh, mode='A'):
+    suffix = ""
+    if mode == 'C': suffix = "(C)"
+    elif mode == 'D': suffix = "(D)"
+    
+    target_sheet_name = f'託收託運回報_篩選{suffix}'
+    
+    ws_date = sh.worksheet('指定日期')
+    date_cell = 'A3' if mode == 'D' else 'A2'
+    target_date_val = ws_date.acell(date_cell).value
+    target_date = format_date(target_date_val)
+    
+    if not target_date:
+        return f"錯誤：指定日期工作表 ({date_cell}) 未設定日期"
+
+    ws_source = sh.worksheet('託收託運回報')
+    raw_data = ws_source.get_all_values()
+    if not raw_data: return "錯誤：來源表是空的"
+
+    headers = deduplicate_headers(raw_data[0])
+    df = pd.DataFrame(raw_data[1:], columns=headers)
+    
+    date_col_idx = 5
+    df['fmt_date'] = df.iloc[:, date_col_idx].apply(format_date)
+    filtered_df = df[df['fmt_date'] == target_date].drop(columns=['fmt_date'])
+    
+    if filtered_df.empty:
+        return f"錯誤：找不到日期 {target_date} 的資料"
+
     try:
-        data = request.json
-        mode = data.get('mode', 'A')
+        ws_target = sh.worksheet(target_sheet_name)
+        ws_target.clear()
+        if ws_target.col_count < 40:
+            ws_target.resize(cols=40)
+    except:
+        ws_target = sh.add_worksheet(target_sheet_name, rows=1000, cols=40)
+    
+    # 🔥 關鍵修正：將所有資料轉為字串，避免 int64 錯誤
+    filtered_df = filtered_df.fillna('').astype(str)
+    
+    update_data = [filtered_df.columns.values.tolist()] + filtered_df.values.tolist()
+    ws_target.update(update_data)
+    
+    return f"[{mode}模態] 篩選完成，共 {len(filtered_df)} 筆"
+
+# --- 🛣️ 步驟 3: 路線比對 + APP3 ---
+def step3_mapping(sh, mode='A'):
+    suffix = ""
+    if mode == 'C': suffix = "(C)"
+    elif mode == 'D': suffix = "(D)"
+    
+    sheet_name = f'託收託運回報_篩選{suffix}'
+    ws = sh.worksheet(sheet_name)
+    
+    if ws.col_count < 40:
+        ws.resize(cols=40)
+    
+    raw_data = ws.get_all_values()
+    if not raw_data: return "錯誤：工作表是空的"
+    
+    headers = deduplicate_headers(raw_data[0])
+    df = pd.DataFrame(raw_data[1:], columns=headers)
+    
+    ws_ref = sh.worksheet('5678月貨主收送點參照')
+    ref_data = ws_ref.get_all_values()
+    df_ref = pd.DataFrame(ref_data[1:], columns=deduplicate_headers(ref_data[0]))
+    
+    mapping = {}
+    for _, row in df_ref.iterrows():
+        key = f"{str(row.iloc[0]).strip()}|{str(row.iloc[1]).strip()}"
+        mapping[key] = {'C': str(row.iloc[2]), 'D': str(row.iloc[3])}
+    
+    ws_code_ref = sh.worksheet('參照')
+    code_data = ws_code_ref.get_all_values()
+    df_code = pd.DataFrame(code_data[1:], columns=deduplicate_headers(code_data[0]))
+    
+    map_ab = dict(zip(df_code.iloc[:, 0].astype(str).str.strip(), df_code.iloc[:, 1]))
+    map_cd = dict(zip(df_code.iloc[:, 2].astype(str).str.strip(), df_code.iloc[:, 3]))
+    map_ef = dict(zip(df_code.iloc[:, 4].astype(str).str.strip(), df_code.iloc[:, 5]))
+
+    col_owner_idx = 4
+    col_h_idx = 7
+    
+    x_values = []
+    ah_values = []
+    ac_values = []
+    aa_values = []
+    ab_values = []
+    
+    for _, row in df.iterrows():
+        owner = str(row.iloc[col_owner_idx]).strip()
+        h_val = str(row.iloc[col_h_idx]).strip()
+        if h_val.startswith('(預)'): h_val = h_val[3:]
         
-        sheets_service = GoogleSheetsService('credentials.json', SPREADSHEET_ID)
-        status_manager = ProcessStatus(sheets_service)
-        route_mapper = RouteMapper(sheets_service)
+        key = f"{owner}|{h_val}"
+        primary_route = ''
+        secondary_route = ''
         
-        status_manager.set_status('STEP3_RUNNING')
+        if key in mapping:
+            ref_data = mapping[key]
+            opts_c = parse_route_options(ref_data['C'])
+            opts_d = parse_route_options(ref_data['D'])
+            all_opts = sorted(opts_c + opts_d, key=lambda x: x['percentage'], reverse=True)
+            
+            if all_opts:
+                primary_route = all_opts[0]['label']
+                if mode == 'B' and len(all_opts) > 1 and all_opts[1]['percentage'] > 40:
+                    secondary_route = all_opts[1]['label']
         
-        result = route_mapper.auto_route_mapping(mode)
+        x_values.append(primary_route)
+        ah_values.append(secondary_route)
         
-        if result:
-            status_manager.set_status('STEP3_COMPLETED')
-            return jsonify({'success': True, 'message': '步驟3：路線比對完成'})
+        x_str = str(primary_route).strip()
+        val_ac = map_ab.get(x_str[:5], '') if len(x_str) >= 5 else ''
+        ac_values.append(val_ac)
+        val_aa = map_cd.get(x_str[0], '') if len(x_str) >= 1 else ''
+        aa_values.append(val_aa)
+        val_ab = map_ef.get(x_str[2], '') if len(x_str) >= 3 else ''
+        ab_values.append(val_ab)
+
+    ws.update('X2', [[x] for x in x_values])
+    
+    if mode == 'B':
+        ws.update('AH2', [[x] for x in ah_values])
+    else:
+        empty_col = [[''] for _ in range(len(x_values))]
+        ws.update('AH2', empty_col)
+        
+    ws.update('AI2', [[''] for _ in range(len(x_values))])
+    ws.update('AA2', [[x] for x in aa_values])
+    ws.update('AB2', [[x] for x in ab_values])
+    ws.update('AC2', [[x] for x in ac_values])
+    
+    return f"[{mode}模態] 路線比對 & APP3 映射完成"
+
+# --- 📊 步驟 4: 創建工作表 ---
+def step4_create(sh, mode='A'):
+    suffix = ""
+    if mode == 'B': suffix = "(B)"
+    elif mode == 'C': suffix = "(C)"
+    elif mode == 'D': suffix = "(D)"
+    
+    src_name = f'託收託運回報_篩選{suffix if mode != "B" else ""}'
+    dst_name = f'當日各路線表{suffix}'
+    summary_name = f'各路線板數{suffix}'
+    
+    ws_src = sh.worksheet(src_name)
+    raw_data = ws_src.get_all_values()
+    if not raw_data: return "錯誤：來源表是空的"
+    
+    headers = deduplicate_headers(raw_data[0])
+    df = pd.DataFrame(raw_data[1:], columns=headers)
+    
+    df = df[~df.iloc[:, 7].astype(str).str.contains('昶青', na=False)]
+    
+    series_x = df.iloc[:, 23]
+    if df.shape[1] > 33:
+        series_ah = df.iloc[:, 33]
+    else:
+        series_ah = pd.Series([''] * len(df), index=df.index)
+        
+    routes = set(series_x[series_x != ''].unique())
+    if mode == 'B':
+        routes.update(series_ah[series_ah != ''].unique())
+    
+    routes = sorted([r for r in routes if r and str(r).strip() != ''])
+    
+    final_rows = []
+    final_rows.append(headers)
+    summary_rows = [['路線名稱', '板數總和', '取貨', '配送']]
+    
+    df['_TEMP_X'] = series_x
+    df['_TEMP_AH'] = series_ah
+    
+    for route in routes:
+        if mode == 'B':
+            mask = (df['_TEMP_X'] == route) | (df['_TEMP_AH'] == route)
         else:
-            status_manager.set_status('STEP3_FAILED')
-            return jsonify({'success': False, 'message': '步驟3失敗'}), 500
+            mask = (df['_TEMP_X'] == route)
             
-    except Exception as e:
-        logger.error(f"步驟3失敗: {e}")
-        return jsonify({'success': False, 'message': str(e)}), 500
+        group = df[mask]
+        if group.empty: continue
+        
+        title_row = [''] * len(headers)
+        title_row[0] = route
+        final_rows.append(title_row)
+        
+        # 🔥 關鍵修正：將 group 資料轉為字串，避免 int64
+        group_values = group.iloc[:, :len(headers)].fillna('').astype(str).values.tolist()
+        final_rows.extend(group_values)
+        
+        col_board_idx = 17
+        # 計算總和
+        total_boards_val = pd.to_numeric(group.iloc[:, col_board_idx], errors='coerce').fillna(0).sum()
+        # 🔥 關鍵修正：強制轉為 Python int
+        total_boards = int(total_boards_val)
+        
+        sum_row = [''] * len(headers)
+        sum_row[col_board_idx] = f"總和: {total_boards}"
+        final_rows.append(sum_row)
+        
+        col_type_idx = 6
+        col_cust_idx = 7
+        pickup_map = {}
+        delivery_map = {}
+        
+        for _, row in group.iterrows():
+            ctype = str(row.iloc[col_type_idx])
+            cust = str(row.iloc[col_cust_idx])
+            # 🔥 關鍵修正：強制轉為 Python int
+            boards = int(pd.to_numeric(row.iloc[col_board_idx], errors='coerce') or 0)
+            
+            if ctype == '取貨':
+                pickup_map[cust] = pickup_map.get(cust, 0) + boards
+            elif ctype == '配送':
+                delivery_map[cust] = delivery_map.get(cust, 0) + boards
+                
+        pickup_str = ", ".join([f"{k} ({v})" for k, v in pickup_map.items()])
+        delivery_str = ", ".join([f"{k} ({v})" for k, v in delivery_map.items()])
+        summary_rows.append([route, total_boards, pickup_str, delivery_str])
+        
+    try:
+        ws_dst = sh.worksheet(dst_name)
+        ws_dst.clear()
+    except:
+        ws_dst = sh.add_worksheet(dst_name, rows=len(final_rows)+100, cols=len(headers))
+    ws_dst.update(final_rows)
+    
+    try:
+        ws_sum = sh.worksheet(summary_name)
+        ws_sum.clear()
+    except:
+        ws_sum = sh.add_worksheet(summary_name, rows=len(summary_rows)+20, cols=5)
+    ws_sum.update(summary_rows)
+    
+    return f"[{mode}模態] 已建立 {dst_name} 與 {summary_name}"
 
-@app.route('/api/step4', methods=['POST'])
-def step4_create_sheets():
-    """步驟4：創建工作表"""
+@app.route('/', methods=['GET'])
+def home():
+    return "物流 AI 系統運作中 (JSON Fix)"
+
+@app.route('/execute', methods=['POST'])
+def execute():
     try:
         data = request.json
+        action = data.get('action')
         mode = data.get('mode', 'A')
-        
-        sheets_service = GoogleSheetsService('credentials.json', SPREADSHEET_ID)
-        status_manager = ProcessStatus(sheets_service)
-        sheet_creator = SheetCreator(sheets_service)
-        
-        status_manager.set_status('STEP4_RUNNING')
-        
-        result = sheet_creator.create_sheets_by_route(mode)
-        
-        if result:
-            status_manager.set_status('STEP4_COMPLETED')
-            return jsonify({'success': True, 'message': '步驟4：創建工作表完成'})
-        else:
-            status_manager.set_status('STEP4_FAILED')
-            return jsonify({'success': False, 'message': '步驟4失敗'}), 500
-            
+        sh = get_sh()
+        msg = ""
+        if action == 'step1': msg = step1_clear(sh, mode)
+        elif action == 'step2': msg = step2_filter(sh, mode)
+        elif action == 'step3': msg = step3_mapping(sh, mode)
+        elif action == 'step4': msg = step4_create(sh, mode)
+        elif action == 'all':
+            msgs = []
+            if mode == 'A': msgs.append(step1_clear(sh, mode))
+            msgs.append(step2_filter(sh, mode))
+            msgs.append(step3_mapping(sh, mode))
+            msgs.append(step4_create(sh, mode))
+            msg = " -> ".join(msgs)
+        return jsonify({"status": "success", "message": msg})
     except Exception as e:
-        logger.error(f"步驟4失敗: {e}")
-        return jsonify({'success': False, 'message': str(e)}), 500
-
-@app.route('/api/execute_all', methods=['POST'])
-def execute_all_steps():
-    """執行所有步驟"""
-    try:
-        data = request.json
-        mode = data.get('mode', 'A')
-        
-        sheets_service = GoogleSheetsService('credentials.json', SPREADSHEET_ID)
-        status_manager = ProcessStatus(sheets_service)
-        
-        status_manager.set_status('ALL_STEPS_RUNNING')
-        
-        # 步驟1
-        workspace_manager = WorkspaceManager(sheets_service)
-        if not workspace_manager.clear_workspace(mode):
-            raise Exception("步驟1失敗")
-        time.sleep(2)
-        
-        # 步驟2
-        date_filter = DateFilter(sheets_service)
-        if not date_filter.filter_data_by_date(mode):
-            raise Exception("步驟2失敗")
-        time.sleep(2)
-        
-        # 步驟3
-        route_mapper = RouteMapper(sheets_service)
-        if not route_mapper.auto_route_mapping(mode):
-            raise Exception("步驟3失敗")
-        time.sleep(2)
-        
-        # 步驟4
-        sheet_creator = SheetCreator(sheets_service)
-        if not sheet_creator.create_sheets_by_route(mode):
-            raise Exception("步驟4失敗")
-        
-        status_manager.set_status('ALL_STEPS_COMPLETED')
-        return jsonify({'success': True, 'message': f'所有步驟完成 (模式: {mode})'})
-        
-    except Exception as e:
-        logger.error(f"執行失敗: {e}")
-        status_manager.set_status('ALL_STEPS_FAILED')
-        return jsonify({'success': False, 'message': str(e)}), 500
-
-@app.route('/api/status', methods=['GET'])
-def get_status():
-    """獲取執行狀態"""
-    try:
-        sheets_service = GoogleSheetsService('credentials.json', SPREADSHEET_ID)
-        status_manager = ProcessStatus(sheets_service)
-        
-        status = status_manager.get_status()
-        return jsonify({'status': status})
-        
-    except Exception as e:
-        logger.error(f"獲取狀態失敗: {e}")
-        return jsonify({'status': 'ERROR', 'message': str(e)}), 500
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    """健康檢查"""
-    return jsonify({'status': 'healthy'})
+        print(f"Error: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=10000)
