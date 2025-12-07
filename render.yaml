@@ -1,12 +1,25 @@
-# render.yaml
+
+### 3. **`render.yaml`** （選用，但推薦）
+
+這個檔案可以讓 Render 自動設定，但**不包含敏感資訊**：
+
+```yaml
 services:
   - type: web
     name: logistics-route-system
     env: python
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app
+    startCommand: gunicorn app:app
     envVars:
-      - key: SPREADSHEET_ID
+      - key: PYTHON_VERSION
+        value: 3.11.7
+      - key: PORT
+        value: 10000
+      # 以下變數需要在 Render Dashboard 手動設定
+      - key: GOOGLE_SHEETS_ID
         sync: false
-      - key: GOOGLE_CREDENTIALS
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: GOOGLE_MAPS_API_KEY
         sync: false
