@@ -1,3 +1,8 @@
+# 環境變數
+.env
+.env.local
+.env.*.local
+
 # Python
 __pycache__/
 *.py[cod]
@@ -7,34 +12,21 @@ __pycache__/
 venv/
 env/
 ENV/
-*.pyc
 
-# 敏感資訊 - 絕對不要提交
+# Google 憑證
 credentials.json
-service-account.json
-*.pem
-*.key
-.env
-.env.local
-.env.*.local
+*.json
+!render.yaml
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*.sublime-project
-*.sublime-workspace
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs
 *.log
-
-# Render 特定
-.render/
-
-# 測試和臨時文件
-test_*.py
-temp/
-tmp/
