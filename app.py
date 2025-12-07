@@ -104,11 +104,9 @@ def step2_filter(sh, mode='A'):
     try:
         ws_target = sh.worksheet(target_sheet_name)
         ws_target.clear()
-        # 🔥 修正點：確保欄位足夠多 (至少 40 欄，涵蓋到 AN)
         if ws_target.col_count < 40:
             ws_target.resize(cols=40)
     except:
-        # 🔥 修正點：創建時直接給 40 欄
         ws_target = sh.add_worksheet(target_sheet_name, rows=1000, cols=40)
     
     update_data = [filtered_df.columns.values.tolist()] + filtered_df.values.tolist()
@@ -125,15 +123,22 @@ def step3_mapping(sh, mode='A'):
     sheet_name = f'託收託運回報_篩選{suffix}'
     ws = sh.worksheet(sheet_name)
     
-    # 🔥 關鍵修正：強制檢查並擴充欄位，避免 "exceeds grid limits" 錯誤
-    # AH 是第 34 欄，我們擴充到 40 欄以策安全
+    # 強制擴充欄位
     if ws.col_count < 40:
         ws.resize(cols=40)
     
-    df = pd.DataFrame(ws.get_all_records())
+    # 🔥 修正：使用 get_all_values() 取代 get_all_records()
+    # 這樣就算標題列有空白或重複，也不會報錯
+    raw_data = ws.get_all_values()
+    if not raw_data: return "錯誤：工作表是空的"
     
+    headers = raw_data[0]
+    df = pd.DataFrame(raw_data[1:], columns=headers)
+    
+    # 讀取參照表 (同樣改用 get_all_values)
     ws_ref = sh.worksheet('5678月貨主收送點參照')
-    df_ref = pd.DataFrame(ws_ref.get_all_records())
+    ref_data = ws_ref.get_all_values()
+    df_ref = pd.DataFrame(ref_data[1:], columns=ref_data[0])
     
     ref_cols = df_ref.columns
     mapping = {}
@@ -141,16 +146,20 @@ def step3_mapping(sh, mode='A'):
         key = f"{str(row[ref_cols[0]]).strip()}|{str(row[ref_cols[1]]).strip()}"
         mapping[key] = {'C': str(row[ref_cols[2]]), 'D': str(row[ref_cols[3]])}
     
+    # 讀取代碼參照表
     ws_code_ref = sh.worksheet('參照')
-    df_code = pd.DataFrame(ws_code_ref.get_all_records())
+    code_data = ws_code_ref.get_all_values()
+    df_code = pd.DataFrame(code_data[1:], columns=code_data[0])
+    
     code_cols = df_code.columns
     map_ab = dict(zip(df_code[code_cols[0]].astype(str).str.strip(), df_code[code_cols[1]]))
     map_cd = dict(zip(df_code[code_cols[2]].astype(str).str.strip(), df_code[code_cols[3]]))
     map_ef = dict(zip(df_code[code_cols[4]].astype(str).str.strip(), df_code[code_cols[5]]))
 
     rep_cols = df.columns
-    col_owner = rep_cols[4]
-    col_h = rep_cols[7]
+    # 確保不會 index out of range
+    col_owner = rep_cols[4] if len(rep_cols) > 4 else ''
+    col_h = rep_cols[7] if len(rep_cols) > 7 else ''
     
     x_values = []
     ah_values = []
@@ -216,13 +225,17 @@ def step4_create(sh, mode='A'):
     summary_name = f'各路線板數{suffix}'
     
     ws_src = sh.worksheet(src_name)
-    df = pd.DataFrame(ws_src.get_all_records())
+    # 🔥 修正：使用 get_all_values()
+    raw_data = ws_src.get_all_values()
+    if not raw_data: return "錯誤：來源表是空的"
+    
+    headers = raw_data[0]
+    df = pd.DataFrame(raw_data[1:], columns=headers)
     
     col_h_name = df.columns[7]
     df = df[~df[col_h_name].astype(str).str.contains('昶青', na=False)]
     
     col_x = df.columns[23]
-    # 🔥 修正點：確保 AH 欄存在於 DataFrame 中，若無則補空值
     if len(df.columns) <= 33:
         df['AH_TEMP'] = ''
         col_ah = 'AH_TEMP'
@@ -236,11 +249,11 @@ def step4_create(sh, mode='A'):
     routes = sorted([r for r in routes if r and str(r).strip() != ''])
     
     final_rows = []
-    headers = df.columns.tolist()
-    # 移除臨時欄位
-    if 'AH_TEMP' in headers: headers.remove('AH_TEMP')
+    # 處理 headers，避免寫入時出錯
+    clean_headers = [h if h else f"Col_{i}" for i, h in enumerate(headers)]
+    if 'AH_TEMP' in headers: clean_headers.remove('AH_TEMP')
     
-    final_rows.append(headers)
+    final_rows.append(clean_headers)
     summary_rows = [['路線名稱', '板數總和', '取貨', '配送']]
     
     for route in routes:
@@ -252,17 +265,16 @@ def step4_create(sh, mode='A'):
         group = df[mask]
         if group.empty: continue
         
-        title_row = [''] * len(headers)
+        title_row = [''] * len(clean_headers)
         title_row[0] = route
         final_rows.append(title_row)
         
-        # 確保 group 的欄位數與 headers 一致
-        group_values = group.iloc[:, :len(headers)].values.tolist()
+        group_values = group.iloc[:, :len(clean_headers)].values.tolist()
         final_rows.extend(group_values)
         
         col_board_idx = 17
         total_boards = pd.to_numeric(group.iloc[:, col_board_idx], errors='coerce').fillna(0).sum()
-        sum_row = [''] * len(headers)
+        sum_row = [''] * len(clean_headers)
         sum_row[col_board_idx] = f"總和: {total_boards}"
         final_rows.append(sum_row)
         
@@ -289,7 +301,7 @@ def step4_create(sh, mode='A'):
         ws_dst = sh.worksheet(dst_name)
         ws_dst.clear()
     except:
-        ws_dst = sh.add_worksheet(dst_name, rows=len(final_rows)+100, cols=len(headers))
+        ws_dst = sh.add_worksheet(dst_name, rows=len(final_rows)+100, cols=len(clean_headers))
     ws_dst.update(final_rows)
     
     try:
@@ -303,7 +315,7 @@ def step4_create(sh, mode='A'):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "物流 AI 系統運作中 (Fixed Grid Limits)"
+    return "物流 AI 系統運作中 (Robust Headers)"
 
 @app.route('/execute', methods=['POST'])
 def execute():
