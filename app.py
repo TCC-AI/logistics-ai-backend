@@ -41,6 +41,25 @@ def format_date(val):
     except:
         return str(val)
 
+def deduplicate_headers(headers):
+    """
+    將重複的標題加上後綴 _1, _2，確保欄位名稱唯一
+    例如: ['備註', '', '備註'] -> ['備註', 'Col_2', '備註_1']
+    """
+    seen = {}
+    new_headers = []
+    for i, h in enumerate(headers):
+        h = str(h).strip()
+        if h == "": h = f"Col_{i+1}" # 給空白標題一個名字
+        
+        if h in seen:
+            seen[h] += 1
+            new_headers.append(f"{h}_{seen[h]}")
+        else:
+            seen[h] = 0
+            new_headers.append(h)
+    return new_headers
+
 # --- 🧹 步驟 1: 清除桌面 ---
 def step1_clear(sh, mode='A'):
     keep_sheets = {
@@ -90,10 +109,15 @@ def step2_filter(sh, mode='A'):
         return f"錯誤：指定日期工作表 ({date_cell}) 未設定日期"
 
     ws_source = sh.worksheet('託收託運回報')
-    data = ws_source.get_all_values()
-    headers = data[0]
-    df = pd.DataFrame(data[1:], columns=headers)
+    raw_data = ws_source.get_all_values()
+    if not raw_data: return "錯誤：來源表是空的"
+
+    # 🔥 使用去重後的標題
+    headers = deduplicate_headers(raw_data[0])
+    df = pd.DataFrame(raw_data[1:], columns=headers)
     
+    # 假設日期在第 6 欄 (index 5)
+    # 使用 iloc 確保選到絕對位置，不依賴欄位名稱
     date_col_idx = 5
     df['fmt_date'] = df.iloc[:, date_col_idx].apply(format_date)
     filtered_df = df[df['fmt_date'] == target_date].drop(columns=['fmt_date'])
@@ -123,43 +147,39 @@ def step3_mapping(sh, mode='A'):
     sheet_name = f'託收託運回報_篩選{suffix}'
     ws = sh.worksheet(sheet_name)
     
-    # 強制擴充欄位
     if ws.col_count < 40:
         ws.resize(cols=40)
     
-    # 🔥 修正：使用 get_all_values() 取代 get_all_records()
-    # 這樣就算標題列有空白或重複，也不會報錯
     raw_data = ws.get_all_values()
     if not raw_data: return "錯誤：工作表是空的"
     
-    headers = raw_data[0]
+    # 🔥 使用去重後的標題
+    headers = deduplicate_headers(raw_data[0])
     df = pd.DataFrame(raw_data[1:], columns=headers)
     
-    # 讀取參照表 (同樣改用 get_all_values)
     ws_ref = sh.worksheet('5678月貨主收送點參照')
     ref_data = ws_ref.get_all_values()
-    df_ref = pd.DataFrame(ref_data[1:], columns=ref_data[0])
+    df_ref = pd.DataFrame(ref_data[1:], columns=deduplicate_headers(ref_data[0]))
     
-    ref_cols = df_ref.columns
+    # 使用 iloc 讀取參照表，避免標題問題
     mapping = {}
     for _, row in df_ref.iterrows():
-        key = f"{str(row[ref_cols[0]]).strip()}|{str(row[ref_cols[1]]).strip()}"
-        mapping[key] = {'C': str(row[ref_cols[2]]), 'D': str(row[ref_cols[3]])}
+        # 假設: 貨主(0), 收送點(1), C(2), D(3)
+        key = f"{str(row.iloc[0]).strip()}|{str(row.iloc[1]).strip()}"
+        mapping[key] = {'C': str(row.iloc[2]), 'D': str(row.iloc[3])}
     
-    # 讀取代碼參照表
     ws_code_ref = sh.worksheet('參照')
     code_data = ws_code_ref.get_all_values()
-    df_code = pd.DataFrame(code_data[1:], columns=code_data[0])
+    df_code = pd.DataFrame(code_data[1:], columns=deduplicate_headers(code_data[0]))
     
-    code_cols = df_code.columns
-    map_ab = dict(zip(df_code[code_cols[0]].astype(str).str.strip(), df_code[code_cols[1]]))
-    map_cd = dict(zip(df_code[code_cols[2]].astype(str).str.strip(), df_code[code_cols[3]]))
-    map_ef = dict(zip(df_code[code_cols[4]].astype(str).str.strip(), df_code[code_cols[5]]))
+    # 建立代碼映射字典 (使用 iloc)
+    map_ab = dict(zip(df_code.iloc[:, 0].astype(str).str.strip(), df_code.iloc[:, 1]))
+    map_cd = dict(zip(df_code.iloc[:, 2].astype(str).str.strip(), df_code.iloc[:, 3]))
+    map_ef = dict(zip(df_code.iloc[:, 4].astype(str).str.strip(), df_code.iloc[:, 5]))
 
-    rep_cols = df.columns
-    # 確保不會 index out of range
-    col_owner = rep_cols[4] if len(rep_cols) > 4 else ''
-    col_h = rep_cols[7] if len(rep_cols) > 7 else ''
+    # 取得回報表欄位名稱 (使用 index)
+    col_owner_idx = 4
+    col_h_idx = 7
     
     x_values = []
     ah_values = []
@@ -168,8 +188,8 @@ def step3_mapping(sh, mode='A'):
     ab_values = []
     
     for _, row in df.iterrows():
-        owner = str(row[col_owner]).strip()
-        h_val = str(row[col_h]).strip()
+        owner = str(row.iloc[col_owner_idx]).strip()
+        h_val = str(row.iloc[col_h_idx]).strip()
         if h_val.startswith('(預)'): h_val = h_val[3:]
         
         key = f"{owner}|{h_val}"
@@ -198,6 +218,7 @@ def step3_mapping(sh, mode='A'):
         val_ab = map_ef.get(x_str[2], '') if len(x_str) >= 3 else ''
         ab_values.append(val_ab)
 
+    # 寫入結果
     ws.update('X2', [[x] for x in x_values])
     
     if mode == 'B':
@@ -225,59 +246,67 @@ def step4_create(sh, mode='A'):
     summary_name = f'各路線板數{suffix}'
     
     ws_src = sh.worksheet(src_name)
-    # 🔥 修正：使用 get_all_values()
     raw_data = ws_src.get_all_values()
     if not raw_data: return "錯誤：來源表是空的"
     
-    headers = raw_data[0]
+    # 🔥 使用去重後的標題
+    headers = deduplicate_headers(raw_data[0])
     df = pd.DataFrame(raw_data[1:], columns=headers)
     
-    col_h_name = df.columns[7]
-    df = df[~df[col_h_name].astype(str).str.contains('昶青', na=False)]
+    # 使用 iloc 進行過濾，避免欄位名稱重複問題
+    # H 欄是 index 7
+    df = df[~df.iloc[:, 7].astype(str).str.contains('昶青', na=False)]
     
-    col_x = df.columns[23]
-    if len(df.columns) <= 33:
-        df['AH_TEMP'] = ''
-        col_ah = 'AH_TEMP'
+    # X 欄 (index 23), AH 欄 (index 33)
+    # 這裡直接用 iloc 取值，保證取到的是 Series (單列)，解決 'unique' 錯誤
+    series_x = df.iloc[:, 23]
+    
+    # 處理 AH 欄 (如果不足 34 欄，補空)
+    if df.shape[1] > 33:
+        series_ah = df.iloc[:, 33]
     else:
-        col_ah = df.columns[33]
-    
-    routes = set(df[col_x].dropna().unique())
+        series_ah = pd.Series([''] * len(df), index=df.index)
+        
+    # 取得唯一路線
+    routes = set(series_x[series_x != ''].unique())
     if mode == 'B':
-        routes.update(df[col_ah].dropna().unique())
+        routes.update(series_ah[series_ah != ''].unique())
     
     routes = sorted([r for r in routes if r and str(r).strip() != ''])
     
     final_rows = []
-    # 處理 headers，避免寫入時出錯
-    clean_headers = [h if h else f"Col_{i}" for i, h in enumerate(headers)]
-    if 'AH_TEMP' in headers: clean_headers.remove('AH_TEMP')
-    
-    final_rows.append(clean_headers)
+    final_rows.append(headers)
     summary_rows = [['路線名稱', '板數總和', '取貨', '配送']]
+    
+    # 為了方便篩選，我們把 series 加回 df (使用臨時名稱)
+    df['_TEMP_X'] = series_x
+    df['_TEMP_AH'] = series_ah
     
     for route in routes:
         if mode == 'B':
-            mask = (df[col_x] == route) | (df[col_ah] == route)
+            mask = (df['_TEMP_X'] == route) | (df['_TEMP_AH'] == route)
         else:
-            mask = (df[col_x] == route)
+            mask = (df['_TEMP_X'] == route)
             
         group = df[mask]
         if group.empty: continue
         
-        title_row = [''] * len(clean_headers)
+        title_row = [''] * len(headers)
         title_row[0] = route
         final_rows.append(title_row)
         
-        group_values = group.iloc[:, :len(clean_headers)].values.tolist()
+        # 取出原始欄位 (排除臨時欄位)
+        group_values = group.iloc[:, :len(headers)].values.tolist()
         final_rows.extend(group_values)
         
+        # 總和計算 (板數在 index 17)
         col_board_idx = 17
         total_boards = pd.to_numeric(group.iloc[:, col_board_idx], errors='coerce').fillna(0).sum()
-        sum_row = [''] * len(clean_headers)
+        sum_row = [''] * len(headers)
         sum_row[col_board_idx] = f"總和: {total_boards}"
         final_rows.append(sum_row)
         
+        # 摘要統計
         col_type_idx = 6
         col_cust_idx = 7
         pickup_map = {}
@@ -301,7 +330,7 @@ def step4_create(sh, mode='A'):
         ws_dst = sh.worksheet(dst_name)
         ws_dst.clear()
     except:
-        ws_dst = sh.add_worksheet(dst_name, rows=len(final_rows)+100, cols=len(clean_headers))
+        ws_dst = sh.add_worksheet(dst_name, rows=len(final_rows)+100, cols=len(headers))
     ws_dst.update(final_rows)
     
     try:
@@ -315,7 +344,7 @@ def step4_create(sh, mode='A'):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "物流 AI 系統運作中 (Robust Headers)"
+    return "物流 AI 系統運作中 (Deduplicated Headers)"
 
 @app.route('/execute', methods=['POST'])
 def execute():
