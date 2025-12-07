@@ -7,17 +7,34 @@ __pycache__/
 venv/
 env/
 ENV/
+*.pyc
 
-# Credentials
+# 敏感資訊 - 絕對不要提交
 credentials.json
+service-account.json
+*.pem
+*.key
 .env
+.env.local
+.env.*.local
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
+*.sublime-project
+*.sublime-workspace
 
 # OS
 .DS_Store
 Thumbs.db
+*.log
+
+# Render 特定
+.render/
+
+# 測試和臨時文件
+test_*.py
+temp/
+tmp/
