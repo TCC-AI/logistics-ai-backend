@@ -2,6 +2,7 @@ import os
 import json
 import re
 import pandas as pd
+import numpy as np  # 新增 numpy 以便處理型別
 import gspread
 from flask import Flask, request, jsonify
 from google.oauth2.service_account import Credentials
@@ -44,13 +45,12 @@ def format_date(val):
 def deduplicate_headers(headers):
     """
     將重複的標題加上後綴 _1, _2，確保欄位名稱唯一
-    例如: ['備註', '', '備註'] -> ['備註', 'Col_2', '備註_1']
     """
     seen = {}
     new_headers = []
     for i, h in enumerate(headers):
         h = str(h).strip()
-        if h == "": h = f"Col_{i+1}" # 給空白標題一個名字
+        if h == "": h = f"Col_{i+1}"
         
         if h in seen:
             seen[h] += 1
@@ -112,12 +112,9 @@ def step2_filter(sh, mode='A'):
     raw_data = ws_source.get_all_values()
     if not raw_data: return "錯誤：來源表是空的"
 
-    # 🔥 使用去重後的標題
     headers = deduplicate_headers(raw_data[0])
     df = pd.DataFrame(raw_data[1:], columns=headers)
     
-    # 假設日期在第 6 欄 (index 5)
-    # 使用 iloc 確保選到絕對位置，不依賴欄位名稱
     date_col_idx = 5
     df['fmt_date'] = df.iloc[:, date_col_idx].apply(format_date)
     filtered_df = df[df['fmt_date'] == target_date].drop(columns=['fmt_date'])
@@ -132,6 +129,9 @@ def step2_filter(sh, mode='A'):
             ws_target.resize(cols=40)
     except:
         ws_target = sh.add_worksheet(target_sheet_name, rows=1000, cols=40)
+    
+    # 🔥 關鍵修正：將所有資料轉為字串，避免 int64 錯誤
+    filtered_df = filtered_df.fillna('').astype(str)
     
     update_data = [filtered_df.columns.values.tolist()] + filtered_df.values.tolist()
     ws_target.update(update_data)
@@ -153,7 +153,6 @@ def step3_mapping(sh, mode='A'):
     raw_data = ws.get_all_values()
     if not raw_data: return "錯誤：工作表是空的"
     
-    # 🔥 使用去重後的標題
     headers = deduplicate_headers(raw_data[0])
     df = pd.DataFrame(raw_data[1:], columns=headers)
     
@@ -161,10 +160,8 @@ def step3_mapping(sh, mode='A'):
     ref_data = ws_ref.get_all_values()
     df_ref = pd.DataFrame(ref_data[1:], columns=deduplicate_headers(ref_data[0]))
     
-    # 使用 iloc 讀取參照表，避免標題問題
     mapping = {}
     for _, row in df_ref.iterrows():
-        # 假設: 貨主(0), 收送點(1), C(2), D(3)
         key = f"{str(row.iloc[0]).strip()}|{str(row.iloc[1]).strip()}"
         mapping[key] = {'C': str(row.iloc[2]), 'D': str(row.iloc[3])}
     
@@ -172,12 +169,10 @@ def step3_mapping(sh, mode='A'):
     code_data = ws_code_ref.get_all_values()
     df_code = pd.DataFrame(code_data[1:], columns=deduplicate_headers(code_data[0]))
     
-    # 建立代碼映射字典 (使用 iloc)
     map_ab = dict(zip(df_code.iloc[:, 0].astype(str).str.strip(), df_code.iloc[:, 1]))
     map_cd = dict(zip(df_code.iloc[:, 2].astype(str).str.strip(), df_code.iloc[:, 3]))
     map_ef = dict(zip(df_code.iloc[:, 4].astype(str).str.strip(), df_code.iloc[:, 5]))
 
-    # 取得回報表欄位名稱 (使用 index)
     col_owner_idx = 4
     col_h_idx = 7
     
@@ -218,7 +213,6 @@ def step3_mapping(sh, mode='A'):
         val_ab = map_ef.get(x_str[2], '') if len(x_str) >= 3 else ''
         ab_values.append(val_ab)
 
-    # 寫入結果
     ws.update('X2', [[x] for x in x_values])
     
     if mode == 'B':
@@ -249,25 +243,17 @@ def step4_create(sh, mode='A'):
     raw_data = ws_src.get_all_values()
     if not raw_data: return "錯誤：來源表是空的"
     
-    # 🔥 使用去重後的標題
     headers = deduplicate_headers(raw_data[0])
     df = pd.DataFrame(raw_data[1:], columns=headers)
     
-    # 使用 iloc 進行過濾，避免欄位名稱重複問題
-    # H 欄是 index 7
     df = df[~df.iloc[:, 7].astype(str).str.contains('昶青', na=False)]
     
-    # X 欄 (index 23), AH 欄 (index 33)
-    # 這裡直接用 iloc 取值，保證取到的是 Series (單列)，解決 'unique' 錯誤
     series_x = df.iloc[:, 23]
-    
-    # 處理 AH 欄 (如果不足 34 欄，補空)
     if df.shape[1] > 33:
         series_ah = df.iloc[:, 33]
     else:
         series_ah = pd.Series([''] * len(df), index=df.index)
         
-    # 取得唯一路線
     routes = set(series_x[series_x != ''].unique())
     if mode == 'B':
         routes.update(series_ah[series_ah != ''].unique())
@@ -278,7 +264,6 @@ def step4_create(sh, mode='A'):
     final_rows.append(headers)
     summary_rows = [['路線名稱', '板數總和', '取貨', '配送']]
     
-    # 為了方便篩選，我們把 series 加回 df (使用臨時名稱)
     df['_TEMP_X'] = series_x
     df['_TEMP_AH'] = series_ah
     
@@ -295,18 +280,20 @@ def step4_create(sh, mode='A'):
         title_row[0] = route
         final_rows.append(title_row)
         
-        # 取出原始欄位 (排除臨時欄位)
-        group_values = group.iloc[:, :len(headers)].values.tolist()
+        # 🔥 關鍵修正：將 group 資料轉為字串，避免 int64
+        group_values = group.iloc[:, :len(headers)].fillna('').astype(str).values.tolist()
         final_rows.extend(group_values)
         
-        # 總和計算 (板數在 index 17)
         col_board_idx = 17
-        total_boards = pd.to_numeric(group.iloc[:, col_board_idx], errors='coerce').fillna(0).sum()
+        # 計算總和
+        total_boards_val = pd.to_numeric(group.iloc[:, col_board_idx], errors='coerce').fillna(0).sum()
+        # 🔥 關鍵修正：強制轉為 Python int
+        total_boards = int(total_boards_val)
+        
         sum_row = [''] * len(headers)
         sum_row[col_board_idx] = f"總和: {total_boards}"
         final_rows.append(sum_row)
         
-        # 摘要統計
         col_type_idx = 6
         col_cust_idx = 7
         pickup_map = {}
@@ -315,7 +302,8 @@ def step4_create(sh, mode='A'):
         for _, row in group.iterrows():
             ctype = str(row.iloc[col_type_idx])
             cust = str(row.iloc[col_cust_idx])
-            boards = pd.to_numeric(row.iloc[col_board_idx], errors='coerce') or 0
+            # 🔥 關鍵修正：強制轉為 Python int
+            boards = int(pd.to_numeric(row.iloc[col_board_idx], errors='coerce') or 0)
             
             if ctype == '取貨':
                 pickup_map[cust] = pickup_map.get(cust, 0) + boards
@@ -344,7 +332,7 @@ def step4_create(sh, mode='A'):
 
 @app.route('/', methods=['GET'])
 def home():
-    return "物流 AI 系統運作中 (Deduplicated Headers)"
+    return "物流 AI 系統運作中 (JSON Fix)"
 
 @app.route('/execute', methods=['POST'])
 def execute():
