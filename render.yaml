@@ -1,0 +1,12 @@
+# render.yaml
+services:
+  - type: web
+    name: logistics-route-system
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app
+    envVars:
+      - key: SPREADSHEET_ID
+        sync: false
+      - key: GOOGLE_CREDENTIALS
+        sync: false
