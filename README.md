@@ -1,22 +1,20 @@
 # 物流路線系統 API
 
-## 環境變數設定
+## 🚀 快速開始
 
-需要在 Render 設定以下環境變數：
+### 環境變數設定
 
-1. `SPREADSHEET_ID`: Google Sheets 的 ID
-2. `GOOGLE_CREDENTIALS`: Service Account 的 JSON 內容
+本專案需要以下環境變數，**請勿將敏感資訊提交到 GitHub**：
 
-## API 端點
+1. **SPREADSHEET_ID**: Google Sheets 的 ID
+   - 從 URL 取得：`https://docs.google.com/spreadsheets/d/[這裡是ID]/edit`
 
-- `POST /api/step1` - 清除桌面
-- `POST /api/step2` - 日期篩選
-- `POST /api/step3` - 路線比對
-- `POST /api/step4` - 創建工作表
-- `POST /api/execute_all` - 執行所有步驟
-- `GET /api/status` - 查看狀態
-- `GET /health` - 健康檢查
+2. **GOOGLE_CREDENTIALS**: Google Service Account 的 JSON 憑證
+   - 格式：完整的 JSON 內容（需壓縮成單行）
+   - 取得方式：從 Google Cloud Console 下載
 
-## 部署
+### 本地開發設定
 
-推送到 GitHub 後，Render 會自動部署。
+1. 複製環境變數範例檔案：
+```bash
+cp .env.example .env
